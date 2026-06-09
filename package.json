@@ -1,0 +1,17 @@
+{
+  "name": "@superheropw/fountain-js",
+  "version": "1.0.0",
+  "description": "Fountain screenplay parser and formatter. Implements the Fountain 1.1 spec (https://fountain.io/syntax/).",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}

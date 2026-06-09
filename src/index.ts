@@ -1,0 +1,707 @@
+/**
+ * @superheropw/fountain-js
+ *
+ * Fountain screenplay parser and formatter.
+ * Implements the Fountain 1.1 spec (https://fountain.io/syntax/)
+ * with extensions for comic panel markers (## headings).
+ *
+ * Inspired by Fountain.js by Matt Daly (https://github.com/mattdaly/Fountain.js/)
+ *
+ * ## Quick-start
+ *
+ * ```ts
+ * import { parse } from "@superheropw/fountain-js";
+ * const doc = parse(sourceText);
+ * console.log(doc.title.title);     // title page "Title:" value
+ * console.log(doc.scenes.length);   // number of scene headings
+ * console.log(doc.characters);      // unique character names
+ * ```
+ */
+
+// ─── Regex patterns (Fountain 1.1 spec) ──────────────────────────────────
+
+const regex = {
+  /** Title page keys per Fountain spec */
+  title_page:
+    /^(title|credit|author[s]?|source|notes|draft date|date|contact|copyright|genre|revision)\s*:/im,
+
+  /** Standard scene heading: INT./EXT./I/E./EST. prefix */
+  scene_heading:
+    /^(?:(?:int|ext|est|int\.\/ext|i\/e)\.?\s+.+)/i,
+
+  /** Forced scene heading: starts with a single dot (not ellipsis) */
+  scene_heading_forced: /^\.(?!\.+)/,
+
+  /** Scene number: #Scene Number# */
+  scene_number: /#(.+)#/,
+
+  /** Transition: CUT TO:, FADE OUT., >TO:, etc. */
+  transition:
+    /^(?:fade\s+(?:to\s+black|out)|cut\s+to\s+black)\.|^(?:> *)?.+\s+to:$/im,
+
+  /** Forced transition: starts with > */
+  transition_forced: /^>\s*(?!=)(?!\[)/,
+
+  /** Centered text: >text< */
+  centered: /^>\s*(.+?)\s*<$/,
+
+  /** Section heading: #, ##, ### */
+  section: /^(#{1,3})\s+(.*)/,
+
+  /** Synopsis: = text */
+  synopsis: /^=\s+(.*)/,
+
+  /** Standalone note: [[text]] */
+  note: /^\[{2}(?!\[+)([\s\S]+?)\]{2}(?!\[+)$/,
+
+  /** Inline note: [[text]] within other elements */
+  note_inline: /\[{2}(?!\[+)([\s\S]+?)\]{2}(?!\[+)/g,
+
+  /** Page break: === or more */
+  page_break: /^={3,}$/,
+
+  /** Line break: two spaces at end of line */
+  line_break: / {2}$/m,
+
+  /** Boneyard open/close */
+  boneyard_open: /^\/\*/,
+  boneyard_close: /\*\//,
+
+  /** Character cue: ALL CAPS (optionally with extension), or @name */
+  character:
+    /^@(.+)|^([A-Z][A-Z0-9 \-_'.]*)(?:\s*\(([^)]+)\))?(\^)?$/,
+
+  /** Parenthetical: (text) */
+  parenthetical: /^\((.+)\)$/,
+
+  /** Emphasis styles (Fountain inline formatting) */
+  bold_italic_underline:
+    /(?:_{1}\*{3}(?=.+\*{3}_{1})|\*{3}_{1}(?=.+_{1}\*{3}))(.+?)(?:\*{3}_{1}|_{1}\*{3})/g,
+  bold_underline:
+    /(?:_{1}\*{2}(?=.+\*{2}_{1})|\*{2}_{1}(?=.+_{1}\*{2}))(.+?)(?:\*{2}_{1}|_{1}\*{2})/g,
+  italic_underline:
+    /(?:_{1}\*{1}(?=.+\*{1}_{1})|\*{1}_{1}(?=.+_{1}\*{1}))(.+?)(?:\*{1}_{1}|_{1}\*{1})/g,
+  bold_italic: /(?:\*{3}(?=.+\*{3}))(.+?)(?:\*{3})/g,
+  bold: /(?:\*{2}(?=.+\*{2}))(.+?)(?:\*{2})/g,
+  italic: /(?:\*{1}(?=.+\*{1}))(.+?)(?:\*{1})/g,
+  underline: /(?:_{1}(?=.+_{1}))(.+?)(?:_{1})/g,
+
+  /** Normalize line endings */
+  standardizer: /\r\n|\r/g,
+
+  /** Split blocks on blank lines */
+  splitter: /\n{2,}/,
+
+  /** Clean leading/trailing whitespace */
+  cleaner: /^\n+|\n+$/g,
+
+  /** Standardize indented character cues (3+ spaces or tab) */
+  whitespacer: /^\t+|^ {3,}/gm,
+};
+
+// ─── Types ────────────────────────────────────────────────────────────────
+
+export type FountainTokenType =
+  | "title_page"
+  | "scene_heading"
+  | "action"
+  | "character"
+  | "parenthetical"
+  | "dialogue"
+  | "dual_dialogue"
+  | "transition"
+  | "centered"
+  | "section"
+  | "panel"
+  | "synopsis"
+  | "page_break"
+  | "note"
+  | "boneyard"
+  | "line_break";
+
+export interface FountainToken {
+  type: FountainTokenType;
+  text: string;
+  /** 1-based line number */
+  line: number;
+  /** For character tokens: the normalized character name */
+  character?: string;
+  /** Dual-dialogue side: 'left' | 'right' */
+  dual?: string;
+  /** Section depth (1-3) */
+  depth?: number;
+  /** Scene number (from #N# in scene heading) */
+  scene_number?: string;
+}
+
+export interface TitlePageData {
+  title?: string;
+  credit?: string;
+  authors?: string[];
+  source?: string;
+  notes?: string;
+  draftDate?: string;
+  date?: string;
+  contact?: string;
+  copyright?: string;
+  genre?: string;
+  revision?: string;
+  /** Any other key:value pairs from the title page */
+  [key: string]: string | string[] | undefined;
+}
+
+export interface FountainDocument {
+  /** All parsed tokens in document order */
+  tokens: FountainToken[];
+  /** Structured title page data */
+  title: TitlePageData;
+  /** Raw title page key:value pairs (preserves original keys) */
+  titlePageRaw: Record<string, string>;
+  /** Unique character names (normalized, deduped) */
+  characters: string[];
+  /** Scene heading tokens */
+  scenes: FountainToken[];
+  /** Number of scenes */
+  sceneCount: number;
+  /** Number of comic panel markers (## headings) */
+  panelCount: number;
+}
+
+export interface EmphasisSpan {
+  type: "bold" | "italic" | "underline" | "bold_italic" | "italic_underline" | "bold_underline" | "bold_italic_underline";
+  text: string;
+}
+
+// ─── Lexer ───────────────────────────────────────────────────────────────
+
+/**
+ * Pre-process raw source: normalize line endings, strip boneyard markers
+ * onto their own lines, standardize whitespace for character cues.
+ */
+function lexer(script: string): string {
+  return script
+    .replace(regex.standardizer, "\n")
+    .replace(regex.cleaner, "")
+    .replace(regex.whitespacer, "");
+}
+
+// ─── Tokenizer ──────────────────────────────────────────────────────────
+
+/**
+ * Split the pre-processed source into blocks separated by blank lines,
+ * then classify each block by Fountain element type.
+ */
+function tokenize(script: string): FountainToken[] {
+  const src = lexer(script).split(regex.splitter).reverse();
+  const tokens: FountainToken[] = [];
+  let lineNum = 1;
+  let dual = false;
+
+  while (src.length) {
+    const block = src.pop()!;
+    lineNum += countNewlines(block);
+
+    if (!block.trim()) continue;
+
+    // ── Title page ──
+    if (regex.title_page.test(block)) {
+      const entries = block.split(/\n/).filter((l) => l.trim());
+      for (const entry of entries) {
+        const colonIdx = entry.indexOf(":");
+        if (colonIdx < 0) continue;
+        const key = entry.slice(0, colonIdx).trim();
+        const value = entry.slice(colonIdx + 1).trim();
+        tokens.push({
+          type: "title_page",
+          text: value,
+          line: lineNum,
+        });
+        tokens.push({
+          type: "title_page" as any,
+          text: key.toLowerCase().replace(/ /g, "_"),
+          line: lineNum,
+        } as any); // key stored as auxiliary token
+      }
+      continue;
+    }
+
+    // ── Scene heading ──
+    if (regex.scene_heading.test(block) || regex.scene_heading_forced.test(block)) {
+      let text = block.trim();
+      if (text.startsWith(".")) text = text.replace(/^\.\s*/, "");
+
+      let sceneNumber: string | undefined;
+      const snMatch = text.match(regex.scene_number);
+      if (snMatch) {
+        sceneNumber = snMatch[1];
+        text = text.replace(regex.scene_number, "");
+      }
+
+      // Avoid false match: indented action that starts with INT./EXT. but
+      // has content on the next line with no scene context
+      if (text.length > 0 && !text.endsWith("  ")) {
+        tokens.push({
+          type: "scene_heading",
+          text: text.trim(),
+          line: lineNum,
+          scene_number: sceneNumber,
+        });
+        continue;
+      }
+    }
+
+    // ── Centered text ──
+    {
+      const match = block.trim().match(regex.centered);
+      if (match) {
+        tokens.push({
+          type: "centered",
+          text: match[1].trim(),
+          line: lineNum,
+        });
+        continue;
+      }
+    }
+
+    // ── Transition ──
+    if (regex.transition.test(block.trim())) {
+      let text = block.trim();
+      if (text.startsWith(">")) text = text.replace(/^>\s*/, "");
+      tokens.push({
+        type: "transition",
+        text: text.trim(),
+        line: lineNum,
+      });
+      continue;
+    }
+
+    // ── Dialogue block (character + parenthetical + dialogue) ──
+    {
+      // Split first line (character cue) from the rest
+      const lines = block.split(/\n/);
+      const firstLine = lines[0].trim();
+      const charMatch = firstLine.match(regex.character);
+
+      if (charMatch) {
+        const charName = (charMatch[1] || charMatch[2]).trim();
+        const extension = charMatch[3] || undefined;
+        const isDual = !!charMatch[4];
+
+        if (charName.length > 0 && !firstLine.endsWith("  ")) {
+          // Parse the rest of the block for dialogue / parenthetical lines
+          const remaining = lines.slice(1).join("\n").trim();
+
+          if (isDual) {
+            tokens.push({ type: "dual_dialogue", text: "", line: lineNum, dual: "end" });
+          }
+          tokens.push({ type: "dialogue", text: "", line: lineNum }); // dialogue_end marker
+
+          // Split dialogue content by parentheticals
+          const parts = remaining
+            .split(/(\(.+\)(?:\n)*)/)
+            .reverse()
+            .filter((p) => p.trim());
+
+          for (const part of parts) {
+            const trimmed = part.trim();
+            if (regex.parenthetical.test(trimmed)) {
+              tokens.push({
+                type: "parenthetical",
+                text: trimmed,
+                line: lineNum + 1,
+              });
+            } else if (trimmed) {
+              tokens.push({
+                type: "dialogue",
+                text: trimmed,
+                line: lineNum + 1,
+                character: charName,
+              });
+            }
+          }
+
+          tokens.push({
+            type: "character",
+            text: extension ? `${charName} (${extension})` : charName,
+            character: charName,
+            line: lineNum,
+            dual: isDual ? (dual ? "left" : undefined) : undefined,
+          });
+
+          if (dual) {
+            tokens.push({ type: "dual_dialogue", text: "", line: lineNum, dual: "begin" });
+          }
+
+          dual = isDual;
+          continue;
+        }
+      }
+    }
+
+    // ── Section / Panel heading ──
+    {
+      const match = block.trim().match(regex.section);
+      if (match) {
+        const depth = match[1].length;
+        const text = match[2].trim();
+        // ## is a comic panel marker
+        if (depth === 2) {
+          tokens.push({
+            type: "panel",
+            text,
+            depth,
+            line: lineNum,
+          });
+        } else {
+          tokens.push({
+            type: "section",
+            text,
+            depth,
+            line: lineNum,
+          });
+        }
+        continue;
+      }
+    }
+
+    // ── Synopsis ──
+    {
+      const match = block.trim().match(regex.synopsis);
+      if (match) {
+        tokens.push({
+          type: "synopsis",
+          text: match[1].trim(),
+          line: lineNum,
+        });
+        continue;
+      }
+    }
+
+    // ── Note (standalone block) ──
+    if (regex.note.test(block.trim())) {
+      const match = block.trim().match(regex.note);
+      if (match) {
+        tokens.push({
+          type: "note",
+          text: match[1].trim(),
+          line: lineNum,
+        });
+        continue;
+      }
+    }
+
+    // ── Page break ──
+    if (regex.page_break.test(block.trim())) {
+      tokens.push({
+        type: "page_break",
+        text: "===",
+        line: lineNum,
+      });
+      continue;
+    }
+
+    // ── Default: Action ──
+    tokens.push({
+      type: "action",
+      text: block.trim(),
+      line: lineNum,
+    });
+  }
+
+  return tokens;
+}
+
+// ─── Title page builder ──────────────────────────────────────────────────
+
+function buildTitlePage(tokens: FountainToken[]): {
+  title: TitlePageData;
+  raw: Record<string, string>;
+} {
+  const raw: Record<string, string> = {};
+  // Title page tokens come in pairs: value then key (from the tokenizer above)
+  // Actually, let's parse from the original approach: scan for consecutive
+  // title_page tokens and pair key→value
+  let i = 0;
+  while (i < tokens.length && tokens[i].type === "title_page") {
+    const value = tokens[i].text;
+    i++;
+    if (i < tokens.length && tokens[i].type === "title_page") {
+      // This second token holds the key (stored as text in our tokenizer hack)
+      const key = tokens[i].text;
+      raw[key] = value;
+      i++;
+    } else {
+      break;
+    }
+  }
+
+  // Remove title page tokens from the main token list
+  const bodyTokens = tokens.filter((t) => t.type !== "title_page");
+
+  const title: TitlePageData = { ...raw };
+
+  // Normalize authors (can be multiple "Author:" lines)
+  const authorKeys = Object.keys(raw).filter((k) => k.startsWith("author"));
+  if (authorKeys.length > 1) {
+    title.authors = authorKeys.map((k) => raw[k]).filter(Boolean) as string[];
+  }
+
+  // Remap common key variants
+  if (raw["draft_date"]) {
+    title.draftDate = raw["draft_date"];
+    delete (title as any)["draft_date"];
+  }
+
+  return { title, raw };
+}
+
+// ─── Main parse function ────────────────────────────────────────────────
+
+/**
+ * Parse a Fountain-formatted string into a structured document.
+ *
+ * ```ts
+ * import { parse } from "@superheropw/fountain-js";
+ * const doc = parse(fountainSource);
+ * ```
+ */
+export function parse(source: string): FountainDocument {
+  // Handle boneyard blocks first — remove them from the source
+  let cleaned = source;
+  cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, ""); // strip boneyard blocks
+
+  // Process inline notes: replace [[...]] with empty string
+  cleaned = cleaned.replace(regex.note_inline, "");
+
+  const rawTokens = tokenize(cleaned);
+
+  // Build title page from tokens
+  const { title, raw: titlePageRaw } = buildTitlePage(rawTokens);
+  const tokens = rawTokens.filter((t) => t.type !== "title_page");
+
+  // Extract characters
+  const characters: string[] = [];
+  const charSet = new Set<string>();
+  for (const tok of tokens) {
+    if (tok.type === "character" && tok.character) {
+      if (!charSet.has(tok.character)) {
+        charSet.add(tok.character);
+        characters.push(tok.character);
+      }
+    }
+  }
+
+  // Extract scenes
+  const scenes = tokens.filter((t) => t.type === "scene_heading");
+
+  return {
+    tokens,
+    title,
+    titlePageRaw,
+    characters,
+    scenes,
+    sceneCount: scenes.length,
+    panelCount: tokens.filter((t) => t.type === "panel").length,
+  };
+}
+
+// ─── Formatter helpers ─────────────────────────────────────────────────
+
+/**
+ * Generate a Fountain title page block from structured data.
+ */
+export function formatTitlePage(data: TitlePageData): string {
+  const lines: string[] = [];
+  if (data.title) lines.push(`Title: ${data.title}`);
+  if (data.credit) lines.push(`Credit: ${data.credit}`);
+  const authors = data.authors || (data.author ? [data.author] : []);
+  for (const a of authors) lines.push(`Author: ${a}`);
+  if (data.source) lines.push(`Source: ${data.source}`);
+  if (data.notes) lines.push(`Notes: ${data.notes}`);
+  if (data.draftDate) lines.push(`Draft date: ${data.draftDate}`);
+  if (data.contact) lines.push(`Contact: ${data.contact}`);
+  if (data.copyright) lines.push(`Copyright: ${data.copyright}`);
+  if (data.genre) lines.push(`Genre: ${data.genre}`);
+  return lines.join("\n");
+}
+
+/**
+ * Generate a Fountain scene heading.
+ * Use `forced = true` for non-standard headings (no INT./EXT. prefix).
+ */
+export function formatSceneHeading(text: string, forced = false): string {
+  if (forced) return `.${text}`;
+  return text.toUpperCase();
+}
+
+/**
+ * Generate a Fountain-formatted dialogue block for a given character.
+ * Names with spaces or mixed casing are @-forced per Fountain spec.
+ */
+export function formatDialogue(characterName: string, lines: string[]): string {
+  const needsForce = /[a-z]/.test(characterName) || /\s/.test(characterName);
+  const cue = needsForce ? `@${characterName}` : characterName.toUpperCase();
+  return `${cue}\n${lines.join("\n")}`;
+}
+
+/**
+ * Format a Fountain transition.
+ */
+export function formatTransition(text: string): string {
+  return text.toUpperCase();
+}
+
+/**
+ * Format a parenthetical in dialogue.
+ */
+export function formatParenthetical(text: string): string {
+  return `(${text})`;
+}
+
+/**
+ * Format a centered line.
+ */
+export function formatCentered(text: string): string {
+  return `>${text}<`;
+}
+
+/**
+ * Format a Fountain note.
+ */
+export function formatNote(text: string): string {
+  return `[[${text}]]`;
+}
+
+/**
+ * Format a section heading (depth 1 or 3). Depth 2 uses formatPanel.
+ */
+export function formatSection(depth: 1 | 2 | 3, text: string): string {
+  return `${"#".repeat(depth)} ${text}`;
+}
+
+/**
+ * Format a panel marker (## heading in comic/screenplay context).
+ */
+export function formatPanel(text: string): string {
+  return `## ${text}`;
+}
+
+/**
+ * Extract location name from a scene heading.
+ *
+ * Strips INT./EXT. prefix, time-of-day suffixes, and character extensions.
+ * Converts ALL-CAPS location names to title case.
+ *
+ * Examples:
+ *  INT. CITY STREET - NIGHT → "City Street"
+ *  EXT. ROOFTOP - CONTINUOUS → "Rooftop"
+ *  .FLASHBACK - THE OLD HOUSE → "Flashback - The Old House"
+ */
+export function extractLocationName(sceneHeading: string): string {
+  let text = sceneHeading.replace(/^\.\s*/, "");
+  text = text.replace(
+    /^(?:INT\.\/EXT\.|I\/E\.|INT\.|EXT\.|EST\.)\s*/i,
+    ""
+  );
+
+  const timeWords =
+    "DAY|NIGHT|CONTINUOUS|SAME TIME|MORNING|AFTERNOON|EVENING|DAWN|DUSK|SUNSET|SUNRISE|MOMENTS LATER|LATER|ANOTHER DAY|FLASHBACK|FLASH FORWARD|INSERT|INTERCUT";
+  const timeRegex = new RegExp(
+    `\\s*-\\s*(?:${timeWords})(?:\\s+-\\s*(?:${timeWords})|(?:\\([^)]+\\)))*\\s*$`,
+    "i"
+  );
+  text = text.replace(timeRegex, "");
+  text = text.replace(/\s+\((?:V\.O\.|O\.S\.|O\.C\.|OFF)\)\s*$/i, "");
+
+  const result = text.trim();
+  if (!result) return sceneHeading.trim();
+  if (result === result.toUpperCase() && result.includes(" ")) {
+    return result
+      .toLowerCase()
+      .replace(/\b(\w)/g, (c) => c.toUpperCase());
+  }
+  return result;
+}
+
+/**
+ * Parse emphasis (bold, italic, underline) from Fountain inline text.
+ * Returns an array of styled spans.
+ */
+export function parseEmphasis(
+  text: string
+): Array<{ text: string; bold?: boolean; italic?: boolean; underline?: boolean }> {
+  const styles: Array<{
+    re: RegExp;
+    type: "bold_italic_underline" | "bold_underline" | "italic_underline" | "bold_italic" | "bold" | "italic" | "underline";
+  }> = [
+    { re: regex.bold_italic_underline, type: "bold_italic_underline" },
+    { re: regex.bold_underline, type: "bold_underline" },
+    { re: regex.italic_underline, type: "italic_underline" },
+    { re: regex.bold_italic, type: "bold_italic" },
+    { re: regex.bold, type: "bold" },
+    { re: regex.italic, type: "italic" },
+    { re: regex.underline, type: "underline" },
+  ];
+
+  // Remove literal escaped chars
+  let s = text
+    .replace(/\\\*/g, "[star]")
+    .replace(/\\_/g, "[underline]");
+
+  let result: Array<{
+    text: string;
+    bold?: boolean;
+    italic?: boolean;
+    underline?: boolean;
+  }> = [{ text: s }];
+
+  for (const { re, type } of styles) {
+    result = result.flatMap((span) => {
+      if (!span.text) return [span];
+      const parts: typeof result = [];
+      let lastIndex = 0;
+      let m: RegExpExecArray | null;
+
+      // Reset regex for global matching
+      const globalRe = new RegExp(re.source, re.flags + "g");
+      while ((m = globalRe.exec(span.text)) !== null) {
+        // Text before match
+        if (m.index > lastIndex) {
+          parts.push({ text: span.text.slice(lastIndex, m.index) });
+        }
+        // The matched emphasis text
+        const inner = m[1] || m[0];
+        parts.push({
+          text: inner,
+          bold: type.includes("bold"),
+          italic: type.includes("italic"),
+          underline: type.includes("underline"),
+        });
+        lastIndex = m.index + m[0].length;
+      }
+      if (lastIndex < span.text.length) {
+        parts.push({ text: span.text.slice(lastIndex) });
+      }
+      return parts.length > 0 ? parts : [span];
+    });
+  }
+
+  // Restore escaped chars
+  for (const span of result) {
+    span.text = span.text
+      .replace(/\[star\]/g, "*")
+      .replace(/\[underline\]/g, "_");
+  }
+
+  return result;
+}
+
+// ─── Utility ────────────────────────────────────────────────────────────
+
+function countNewlines(text: string): number {
+  let count = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n") count++;
+  }
+  return count;
+}
