@@ -417,33 +417,38 @@ function buildTitlePage(tokens: FountainToken[]): {
   title: TitlePageData;
   raw: Record<string, string>;
 } {
-  const raw: Record<string, string> = {};
-  // Title page tokens come in pairs: value then key (from the tokenizer above)
-  // Actually, let's parse from the original approach: scan for consecutive
-  // title_page tokens and pair key→value
+  const rawPairs: Record<string, string[]> = {};
+  // Title page tokens come in pairs: value then key (from the tokenizer)
   let i = 0;
   while (i < tokens.length && tokens[i].type === "title_page") {
     const value = tokens[i].text;
     i++;
     if (i < tokens.length && tokens[i].type === "title_page") {
-      // This second token holds the key (stored as text in our tokenizer hack)
       const key = tokens[i].text;
-      raw[key] = value;
+      if (!rawPairs[key]) rawPairs[key] = [];
+      rawPairs[key].push(value);
       i++;
     } else {
       break;
     }
   }
 
-  // Remove title page tokens from the main token list
-  const bodyTokens = tokens.filter((t) => t.type !== "title_page");
+  // Flatten: single values stay as string, multiple values become arrays
+  const raw: Record<string, string> = {};
+  for (const [key, values] of Object.entries(rawPairs)) {
+    if (values.length === 1) {
+      raw[key] = values[0];
+    } else {
+      raw[key] = values.join(", ");
+    }
+  }
 
   const title: TitlePageData = { ...raw };
 
-  // Normalize authors (can be multiple "Author:" lines)
-  const authorKeys = Object.keys(raw).filter((k) => k.startsWith("author"));
-  if (authorKeys.length > 1) {
-    title.authors = authorKeys.map((k) => raw[k]).filter(Boolean) as string[];
+  // Normalize authors: always produce an array when author keys exist
+  const authorKeys = Object.keys(rawPairs).filter((k) => k.startsWith("author"));
+  if (authorKeys.length > 0) {
+    title.authors = authorKeys.flatMap((k) => rawPairs[k]);
   }
 
   // Remap common key variants
@@ -470,8 +475,15 @@ export function parse(source: string): FountainDocument {
   let cleaned = source;
   cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, ""); // strip boneyard blocks
 
-  // Process inline notes: replace [[...]] with empty string
-  cleaned = cleaned.replace(regex.note_inline, "");
+  // Process inline notes (non-standalone): replace [[...]] that are NOT on their own line
+  // Standalone note blocks (entire block is [[...]]) are preserved for tokenizer
+  cleaned = cleaned.replace(/\[\[(?!\[)([\s\S]+?)\]\](?!\])/gm, (match, inner, offset) => {
+    // Check if this note is standalone (its own paragraph)
+    const before = cleaned.slice(Math.max(0, offset - 2), offset);
+    const after = cleaned.slice(offset + match.length, offset + match.length + 2);
+    const isStandalone = (before === '' || /\n/.test(before)) && (after === '' || /^\n/.test(after));
+    return isStandalone ? match : '';
+  });
 
   const rawTokens = tokenize(cleaned);
 
@@ -662,25 +674,24 @@ export function parseEmphasis(
       let lastIndex = 0;
       let m: RegExpExecArray | null;
 
-      // Reset regex for global matching
-      const globalRe = new RegExp(re.source, re.flags + "g");
+      const globalRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
       while ((m = globalRe.exec(span.text)) !== null) {
         // Text before match
         if (m.index > lastIndex) {
-          parts.push({ text: span.text.slice(lastIndex, m.index) });
+          parts.push({ text: span.text.slice(lastIndex, m.index), bold: span.bold, italic: span.italic, underline: span.underline });
         }
         // The matched emphasis text
         const inner = m[1] || m[0];
         parts.push({
           text: inner,
-          bold: type.includes("bold"),
-          italic: type.includes("italic"),
-          underline: type.includes("underline"),
+          bold: type.includes("bold") || !!span.bold,
+          italic: type.includes("italic") || !!span.italic,
+          underline: type.includes("underline") || !!span.underline,
         });
         lastIndex = m.index + m[0].length;
       }
       if (lastIndex < span.text.length) {
-        parts.push({ text: span.text.slice(lastIndex) });
+        parts.push({ text: span.text.slice(lastIndex), bold: span.bold, italic: span.italic, underline: span.underline });
       }
       return parts.length > 0 ? parts : [span];
     });
