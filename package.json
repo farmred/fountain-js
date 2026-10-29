@@ -1,6 +1,6 @@
 {
   "name": "@superheropw/fountain-js",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Fountain screenplay parser and formatter. Implements the Fountain 1.1 spec (https://fountain.io/syntax/).",
   "type": "module",
   "main": "dist/index.js",
