@@ -221,28 +221,35 @@ function tokenize(script) {
         }
         // ── Section / Panel heading ──
         {
-            const match = block.trim().match(regex.section);
-            if (match) {
-                const depth = match[1].length;
-                const text = match[2].trim();
-                // ## is a comic panel marker
-                if (depth === 2) {
+            const startMatch = block.trim().match(regex.section);
+            if (startMatch) {
+                // A block may contain several consecutive heading lines (e.g. a
+                // section and its sub-panels written without blank lines) — emit one
+                // token per heading line and hand any remaining content back to the
+                // block stack for normal classification.
+                const lines = block.trim().split(/\n/);
+                let consumed = 0;
+                for (const line of lines) {
+                    const headingMatch = line.trim().match(regex.section);
+                    if (!headingMatch)
+                        break;
+                    const depth = headingMatch[1].length;
+                    const headingText = headingMatch[2].trim();
+                    // ## is a comic panel marker
                     tokens.push({
-                        type: "panel",
-                        text,
+                        type: depth === 2 ? "panel" : "section",
+                        text: headingText,
                         depth,
                         line: lineNum,
                     });
+                    consumed++;
                 }
-                else {
-                    tokens.push({
-                        type: "section",
-                        text,
-                        depth,
-                        line: lineNum,
-                    });
+                if (consumed > 0) {
+                    const rest = lines.slice(consumed).join("\n").trim();
+                    if (rest)
+                        src.push(rest); // stack top = next popped block
+                    continue;
                 }
-                continue;
             }
         }
         // ── Synopsis ──
@@ -339,22 +346,56 @@ function buildTitlePage(tokens) {
  * ```
  */
 export function parse(source) {
+    // Handle boneyard blocks — strip them from the source but keep them as
+    // `boneyard` tokens (their line is relative to the pre-strip source).
+    const boneyardMatches = [];
+    {
+        let cleaned = source.replace(regex.standardizer, "\n");
+        const re = /\/\*[\s\S]*?\*\//g;
+        let m;
+        while ((m = re.exec(cleaned))) {
+            boneyardMatches.push({
+                line: cleaned.slice(0, m.index).split("\n").length,
+                text: m[0].replace(/^\/\*/, "").replace(/\*\/$/, "").trim(),
+            });
+        }
+    }
     // Handle boneyard blocks first — remove them from the source
     let cleaned = source;
     cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, ""); // strip boneyard blocks
     // Process inline notes (non-standalone): replace [[...]] that are NOT on their own line
     // Standalone note blocks (entire block is [[...]]) are preserved for tokenizer
+    const inlineNoteMatches = [];
     cleaned = cleaned.replace(/\[\[(?!\[)([\s\S]+?)\]\](?!\])/gm, (match, inner, offset) => {
         // Check if this note is standalone (its own paragraph)
         const before = cleaned.slice(Math.max(0, offset - 2), offset);
         const after = cleaned.slice(offset + match.length, offset + match.length + 2);
         const isStandalone = (before === '' || /\n/.test(before)) && (after === '' || /^\n/.test(after));
-        return isStandalone ? match : '';
+        if (isStandalone)
+            return match;
+        inlineNoteMatches.push({
+            line: cleaned.slice(0, offset).split("\n").length,
+            text: inner.trim(),
+        });
+        return '';
     });
     const rawTokens = tokenize(cleaned);
     // Build title page from tokens
     const { title, raw: titlePageRaw } = buildTitlePage(rawTokens);
     const tokens = rawTokens.filter((t) => t.type !== "title_page");
+    if (boneyardMatches.length || inlineNoteMatches.length) {
+        // Insert hidden-content tokens at their original positions (stable merge:
+        // relative order of regular tokens is preserved; hidden tokens are placed
+        // before the first token whose line is later than the hidden block's).
+        for (const hidden of [...boneyardMatches.map((h) => ({ ...h, type: "boneyard" })), ...inlineNoteMatches.map((h) => ({ ...h, type: "note" }))]) {
+            const token = ({ type: hidden.type, text: hidden.text, line: hidden.line });
+            const insertAt = tokens.findIndex((t) => t.line >= hidden.line);
+            if (insertAt === -1)
+                tokens.push(token);
+            else
+                tokens.splice(insertAt, 0, token);
+        }
+    }
     // Extract characters
     const characters = [];
     const charSet = new Set();
