@@ -18,5 +18,21 @@
     "typescript": "^5.0.0",
     "vitest": "^3.2.1"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/farmred/fountain-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/farmred/fountain-js/issues"
+  },
+  "homepage": "https://github.com/farmred/fountain-js#readme",
+  "keywords": [
+    "fountain",
+    "screenplay",
+    "comic",
+    "script",
+    "parser",
+    "writing"
+  ]
 }

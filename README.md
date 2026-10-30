@@ -368,3 +368,10 @@ npm run test:watch # Watch mode
 ## License
 
 MIT
+## Used by
+
+Powers the script engine in [superhero.pw](https://superhero.pw) — the series-first production workspace for comics and episodic storytelling — including the free [Fountain editor](https://app.superhero.pw/fountain-editor), the [Fountain → Markdown converter](https://app.superhero.pw/fountain-converter), and the [Script Analyzer](https://app.superhero.pw/script-analyzer) (all run in the browser, no account needed).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
